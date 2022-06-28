@@ -1337,6 +1337,17 @@ static void nvme_post_cqes(void *opaque)
         nvme_inc_cq_tail(cq);
         nvme_sg_unmap(&req->sg);
         QTAILQ_INSERT_TAIL(&sq->req_list, req, entry);
+#ifdef SMALL_ZONE
+    	if ((req->cmd.opcode == NVME_CMD_WRITE 
+			|| req->cmd.opcode == NVME_CMD_ZONE_APPEND 
+			|| req->cmd.opcode == NVME_CMD_READ) 
+			&& req->sq->sqid) {
+
+			pthread_mutex_lock(&req->sq->ctrl->mtx_chip_status);
+			nvme_cq(req)->ctrl->chip_status[req->chip_idx]--;
+			pthread_mutex_unlock(&req->sq->ctrl->mtx_chip_status);
+		}
+#endif
     }
     if (cq->tail != cq->head) {
         if (cq->irq_enabled && !pending) {
@@ -1349,6 +1360,12 @@ static void nvme_post_cqes(void *opaque)
 
 static void nvme_enqueue_req_completion(NvmeCQueue *cq, NvmeRequest *req)
 {
+#ifdef SMALL_ZONE
+    uint64_t total_blk_in_byte;
+    uint32_t thr_targ = 0;		//throttling (us)
+    uint32_t req_time_taken = 0; //us
+    uint32_t latency = 0;
+#endif
     assert(cq->cqid == req->sq->cqid);
     trace_pci_nvme_enqueue_req_completion(nvme_cid(req), cq->cqid,
                                           le32_to_cpu(req->cqe.result),
@@ -1362,7 +1379,42 @@ static void nvme_enqueue_req_completion(NvmeCQueue *cq, NvmeRequest *req)
 
     QTAILQ_REMOVE(&req->sq->out_req_list, req, entry);
     QTAILQ_INSERT_TAIL(&cq->req_list, req, entry);
+#ifdef SMALL_ZONE
+    if ((req->cmd.opcode == NVME_CMD_WRITE 
+		|| req->cmd.opcode == NVME_CMD_READ
+		|| req->cmd.opcode == NVME_CMD_ZONE_APPEND)
+		&& req->sq->sqid) {
+
+		NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+		total_blk_in_byte = (rw->nlb + 1) * 4096;
+
+		if (req->cmd.opcode == NVME_CMD_WRITE || req->cmd.opcode == NVME_CMD_ZONE_APPEND)
+		    thr_targ = total_blk_in_byte / (WRITE_BW_PER_CHIP);
+		else
+	    	thr_targ = total_blk_in_byte / (READ_BW_PER_CHIP);
+
+		req_time_taken = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) - req->req_time;
+
+#ifdef DBG_SMALL_ZONE
+		qemu_log("nlb: %d\n", rw->nlb);
+		qemu_log("Throttling Target (us): %d\n", thr_targ);
+		qemu_log("Current request has taken time (us): %d\n", req_time_taken);
+#endif
+
+		if (thr_targ < req_time_taken) {
+	    	thr_targ = 0;
+	    	req_time_taken = 0;
+		}
+
+		latency = thr_targ - req_time_taken;
+    }
+#ifdef DBG_SMALL_ZONE
+    qemu_log("current clk before throttling(us): %ld\n", qemu_clock_get_us(QEMU_CLOCK_VIRTUAL));
+#endif
+    timer_mod(cq->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500 + latency*1000);
+#else
     timer_mod(cq->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500);
+#endif
 }
 
 static void nvme_process_aers(void *opaque)
@@ -4234,6 +4286,47 @@ static uint16_t nvme_del_sq(NvmeCtrl *n, NvmeRequest *req)
     return NVME_SUCCESS;
 }
 
+#ifdef SMALL_ZONE
+void *chip_ctrl(void *p)
+{
+    NvmeCtrl *n = (NvmeCtrl *)p;
+    NvmeRequest *req;
+    uint16_t status;
+
+    while(1) {
+       	for (int i = 0 ; i < CHIP_N; i++) {
+       	    if( n->chip_status[i] < CHIP_Q_DEPTH && !QTAILQ_EMPTY(&n->chip_req_list[i])) {
+
+	   			pthread_mutex_lock(&n->mtx_chip_req);
+       	        req = QTAILQ_FIRST(&n->chip_req_list[i]);
+       	        QTAILQ_REMOVE(&n->chip_req_list[i], req, entry);
+                QTAILQ_INSERT_TAIL(&req->sq->out_req_list, req, entry);
+	        	pthread_mutex_unlock(&n->mtx_chip_req);
+       	        
+	        	pthread_mutex_lock(&n->mtx_chip_status);
+#ifdef DBG_SMALL_ZONE
+       			qemu_log("Send Command in Chip #%d\n",i);
+#endif
+	    		n->chip_status[i]++;
+	        	pthread_mutex_unlock(&n->mtx_chip_status);
+
+	        	req->req_time = qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
+
+       	        status = nvme_io_cmd(n, req);
+
+    	        NvmeCQueue *cq = n->cq[req->sq->cqid];
+
+       			if (status != NVME_NO_COMPLETE) {
+       		    	req->status = status;
+       		    	nvme_enqueue_req_completion(cq, req);
+		    	continue;
+       			}
+       	    }
+       	}
+    } 
+}
+#endif
+
 static void nvme_init_sq(NvmeSQueue *sq, NvmeCtrl *n, uint64_t dma_addr,
                          uint16_t sqid, uint16_t cqid, uint16_t size)
 {
@@ -5828,6 +5921,10 @@ static void nvme_process_sq(void *opaque)
     hwaddr addr;
     NvmeCmd cmd;
     NvmeRequest *req;
+#ifdef SMALL_ZONE
+    NvmeRwCmd *rw;
+    uint32_t chip_idx;
+#endif
 
     while (!(nvme_sq_empty(sq) || QTAILQ_EMPTY(&sq->req_list))) {
         addr = sq->dma_addr + sq->head * n->sqe_size;
@@ -5841,13 +5938,47 @@ static void nvme_process_sq(void *opaque)
 
         req = QTAILQ_FIRST(&sq->req_list);
         QTAILQ_REMOVE(&sq->req_list, req, entry);
-        QTAILQ_INSERT_TAIL(&sq->out_req_list, req, entry);
-        nvme_req_clear(req);
-        req->cqe.cid = cmd.cid;
-        memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
+#ifdef SMALL_ZONE
+        if ((cmd.opcode != NVME_CMD_WRITE 
+			&& cmd.opcode != NVME_CMD_READ 
+			&& cmd.opcode != NVME_CMD_ZONE_APPEND) 
+			|| !sq->sqid) {
 
+		    QTAILQ_INSERT_TAIL(&sq->out_req_list, req, entry);
+		}
+#else
+		QTAILQ_INSERT_TAIL(&sq->out_req_list, req, entry);
+#endif
+		nvme_req_clear(req);
+		req->cqe.cid = cmd.cid;
+		memcpy(&req->cmd, &cmd, sizeof(NvmeCmd));
+
+#ifdef SMALL_ZONE
+		rw = (NvmeRwCmd *)&cmd;
+		chip_idx = (rw->slba * 4096 / (unsigned long)(ZONE_SZ)) % CHIP_N;
+		req->chip_idx = chip_idx;
+	
+		if (sq->sqid) { //io cmd
+#ifdef DBG_SMALL_ZONE
+	    	qemu_log("Insert New SQ Command (chip_idx: %d, slba: %ld)\n", chip_idx, rw->slba);
+#endif 
+        	if (cmd.opcode == NVME_CMD_WRITE || cmd.opcode == NVME_CMD_READ || cmd.opcode == NVME_CMD_ZONE_APPEND) { 
+				pthread_mutex_lock(&n->mtx_chip_req);
+				QTAILQ_INSERT_TAIL(&n->chip_req_list[chip_idx], req, entry);
+				status = NVME_NO_COMPLETE;
+				pthread_mutex_unlock(&n->mtx_chip_req);
+	    	}
+	    	else {
+				status = nvme_io_cmd(n, req);
+	    	}
+		}
+		else {
+	    	status = nvme_admin_cmd(n, req);
+		}
+#else
         status = sq->sqid ? nvme_io_cmd(n, req) :
-            nvme_admin_cmd(n, req);
+           	nvme_admin_cmd(n, req);
+#endif
         if (status != NVME_NO_COMPLETE) {
             req->status = status;
             nvme_enqueue_req_completion(cq, req);
@@ -6580,6 +6711,13 @@ static void nvme_init_state(NvmeCtrl *n)
     n->features.temp_thresh_hi = NVME_TEMPERATURE_WARNING;
     n->starttime_ms = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     n->aer_reqs = g_new0(NvmeRequest *, n->params.aerl + 1);
+#ifdef SMALL_ZONE
+    pthread_t p_thread;
+    pthread_create(&p_thread, NULL, chip_ctrl, (void*)n);
+    for (int i = 0; i < CHIP_N; i ++) {
+        QTAILQ_INIT(&n->chip_req_list[i]);
+    }
+#endif
 }
 
 static void nvme_init_cmb(NvmeCtrl *n, PCIDevice *pci_dev)

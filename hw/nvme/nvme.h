@@ -28,6 +28,14 @@
 #define NVME_MAX_NAMESPACES  256
 #define NVME_EUI64_DEFAULT ((uint64_t)0x5254000000000000)
 
+//#define SMALL_ZONE
+//#define DBG_SMALL_ZONE
+#define WRITE_BW_PER_CHIP 50 //MB/s
+#define READ_BW_PER_CHIP 250 //MB/s
+#define CHIP_N 128
+#define CHIP_Q_DEPTH 1
+#define ZONE_SZ 128*1024*1024
+
 QEMU_BUILD_BUG_ON(NVME_MAX_NAMESPACES > NVME_NSID_BROADCAST - 1);
 
 typedef struct NvmeCtrl NvmeCtrl;
@@ -309,6 +317,10 @@ typedef struct NvmeRequest {
     BlockAcctCookie         acct;
     NvmeSg                  sg;
     QTAILQ_ENTRY(NvmeRequest)entry;
+#ifdef SMALL_ZONE
+    uint32_t		    	chip_idx;
+    time_t		    		req_time;
+#endif
 } NvmeRequest;
 
 typedef struct NvmeBounceContext {
@@ -476,6 +488,12 @@ typedef struct NvmeCtrl {
         uint32_t                async_config;
         NvmeHostBehaviorSupport hbs;
     } features;
+#ifdef SMALL_ZONE
+    uint32_t					chip_status[CHIP_N];
+    QTAILQ_HEAD(, NvmeRequest)	chip_req_list[CHIP_N];
+    pthread_mutex_t 			mtx_chip_status;
+    pthread_mutex_t 			mtx_chip_req;
+#endif
 } NvmeCtrl;
 
 static inline NvmeNamespace *nvme_ns(NvmeCtrl *n, uint32_t nsid)
@@ -518,5 +536,8 @@ uint16_t nvme_bounce_mdata(NvmeCtrl *n, void *ptr, uint32_t len,
 void nvme_rw_complete_cb(void *opaque, int ret);
 uint16_t nvme_map_dptr(NvmeCtrl *n, NvmeSg *sg, size_t len,
                        NvmeCmd *cmd);
+#ifdef SMALL_ZONE
+void *chip_ctrl(void *p);
+#endif
 
 #endif /* HW_NVME_INTERNAL_H */
